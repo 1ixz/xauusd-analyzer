@@ -1,9 +1,10 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import feedparser
+import requests
+from streamlit_autorefresh import st_autorefresh
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, EMAIndicator
 from ta.volatility import AverageTrueRange, BollingerBands
@@ -20,7 +21,7 @@ st.set_page_config(
 )
 
 st.title("🥇 XAUUSD AI Analyzer")
-st.caption("تحليل فني + تحليل إخباري لسوق الذهب (Gold / USD)")
+st.caption("تحليل فني + تحليل إخباري لسوق الذهب (Gold / USD) — سعر حي (Spot)")
 
 st.info(
     "⚠️ تنويه مهم: هذا الموقع أداة مساعدة للتحليل فقط. "
@@ -34,45 +35,77 @@ st.info(
 # =========================================================
 
 TIMEFRAMES = {
-    "15M": {"interval": "15m", "period": "1mo"},
-    "30M": {"interval": "30m", "period": "2mo"},
-    "1H": {"interval": "1h", "period": "3mo"},
-    "4H": {"interval": "1h", "period": "6mo"},
-    "1D": {"interval": "1d", "period": "2y"},
+    "1M": "1min",
+    "5M": "5min",
+    "15M": "15min",
+    "30M": "30min",
+    "1H": "1h",
+    "4H": "4h",
+    "1D": "1day",
 }
 
 with st.sidebar:
     st.header("⚙️ الإعدادات")
-    tf_choice = st.selectbox("الفريم الزمني", list(TIMEFRAMES.keys()), index=2)
-    st.caption("اختر الفريم اللي تحلل عليه")
+    api_key = st.text_input("TwelveData API Key", type="password",
+                             help="سجل مجانًا بموقع twelvedata.com وحط مفتاحك هنا")
+    tf_choice = st.selectbox("الفريم الزمني", list(TIMEFRAMES.keys()), index=4)
+    refresh_seconds = st.slider("تحديث تلقائي كل (ثانية)", 30, 300, 60, step=30)
+    st.caption("الشارت يتحدث لحاله بالمدة المحددة فوق")
     st.divider()
-    st.caption("آخر تحديث للبيانات تلقائي كل دقيقة")
+
+if not api_key:
+    st.warning("⬅️ حط مفتاح TwelveData API بالشريط الجانبي حتى يشتغل الموقع بالسعر الحي الحقيقي.")
+    st.stop()
+
+# التحديث التلقائي للصفحة
+st_autorefresh(interval=refresh_seconds * 1000, key="live_refresh")
 
 
 # =========================================================
-# 1) جلب بيانات الذهب
+# 1) جلب بيانات الذهب الحية (Spot) من TwelveData
 # =========================================================
 
-@st.cache_data(ttl=60)
-def get_price_data(interval, period):
-    data = yf.download("GC=F", period=period, interval=interval, auto_adjust=False)
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    return data.dropna()
+@st.cache_data(ttl=30)
+def get_price_data(interval, key):
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": "XAU/USD",
+        "interval": interval,
+        "outputsize": 300,
+        "apikey": key,
+        "order": "ASC",
+    }
+    r = requests.get(url, params=params, timeout=15)
+    payload = r.json()
+
+    if "values" not in payload:
+        return pd.DataFrame(), payload.get("message", "خطأ غير معروف بجلب البيانات")
+
+    df = pd.DataFrame(payload["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.set_index("datetime").sort_index()
+
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+
+    df = df.rename(columns={
+        "open": "Open", "high": "High", "low": "Low", "close": "Close"
+    })
+
+    return df[["Open", "High", "Low", "Close"]], None
 
 
 tf_settings = TIMEFRAMES[tf_choice]
-data = get_price_data(tf_settings["interval"], tf_settings["period"])
-
-if tf_choice == "4H" and not data.empty:
-    data = data.resample("4h").agg({
-        "Open": "first", "High": "max", "Low": "min",
-        "Close": "last", "Volume": "sum"
-    }).dropna()
+data, error_msg = get_price_data(tf_settings, api_key)
 
 if data.empty:
-    st.error("لم نستطع جلب بيانات الذهب حاليًا. جرب فريم زمني آخر أو حدّث الصفحة.")
+    st.error(f"لم نستطع جلب بيانات الذهب الحية. السبب: {error_msg}")
+    st.caption("تأكد أن مفتاح API صحيح، أو انتظر دقيقة إذا تجاوزت الحد المجاني للطلبات.")
     st.stop()
+
+live_price_col1, live_price_col2 = st.columns([1, 3])
+with live_price_col1:
+    st.caption(f"🟢 بيانات حية — آخر تحديث: {data.index[-1].strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 # =========================================================
