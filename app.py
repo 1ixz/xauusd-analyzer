@@ -21,12 +21,12 @@ st.set_page_config(
 )
 
 st.title("🥇 XAUUSD AI Analyzer")
-st.caption("تحليل فني + تحليل إخباري لسوق الذهب (Gold / USD) — سعر حي (Spot)")
+st.caption("تحليل فني متعدد الفريمات + سيولة + أخبار — لسوق الذهب (Gold / USD) — سعر حي (Spot)")
 
 st.info(
-    "⚠️ تنويه مهم: هذا الموقع أداة مساعدة للتحليل فقط. "
-    "لا توجد أي أداة بالعالم تضمن نتيجة التداول 100%. "
-    "استخدم هذه الإشارات كجزء من قرارك، مو كل القرار، وأدر رأس المال بحذر."
+    "⚠️ تنويه مهم: هذا الموقع أداة مساعدة للتحليل فقط. لا توجد أي استراتيجية أو أداة بالعالم "
+    "تضمن نتيجة التداول 100%، وأي نظام يدعي عكس هذا غير صادق. هذه الأداة تجمع عدة مفاهيم "
+    "تحليلية احترافية لتعطيك رأي أقوى وأوضح، مو وعد بربح مؤكد. أدر رأس مالك بحذر دائمًا."
 )
 
 
@@ -41,6 +41,17 @@ TIMEFRAMES = {
     "30M": "30min",
     "1H": "1h",
     "4H": "4h",
+    "1D": "1day",
+}
+
+# الفريم الأعلى المستخدم لتأكيد الاتجاه العام (Multi-Timeframe Confirmation)
+HIGHER_TF_MAP = {
+    "1M": "15min",
+    "5M": "1h",
+    "15M": "1h",
+    "30M": "4h",
+    "1H": "4h",
+    "4H": "1day",
     "1D": "1day",
 }
 
@@ -60,7 +71,6 @@ if not api_key:
     st.warning("⬅️ حط مفتاح TwelveData API بالشريط الجانبي حتى يشتغل الموقع بالسعر الحي الحقيقي.")
     st.stop()
 
-# التحديث التلقائي للصفحة (فقط لتبويب التحليل الحي)
 st_autorefresh(interval=refresh_seconds * 1000, key="live_refresh")
 
 
@@ -68,7 +78,7 @@ st_autorefresh(interval=refresh_seconds * 1000, key="live_refresh")
 # دوال مشتركة: جلب البيانات وحساب المؤشرات
 # =========================================================
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=45)
 def get_price_data(interval, key, outputsize=300):
     url = "https://api.twelvedata.com/time_series"
     params = {
@@ -123,7 +133,6 @@ def add_indicators(df):
 
 
 def technical_score(price, ema20, ema50, ema200, rsi, macd_value, macd_signal):
-    """يرجع score ولايبلات كل مؤشر — نفس المنطق يستخدم بالتحليل الحي والباك تست"""
     score = 0
 
     if price > ema200:
@@ -164,6 +173,55 @@ def technical_score(price, ema20, ema50, ema200, rsi, macd_value, macd_signal):
     return score, trend_label, momentum_label, rsi_label, macd_label, ema200_label
 
 
+def get_higher_tf_bias(interval, key):
+    """يجيب الاتجاه العام من فريم زمني أعلى، لتفادي الدخول عكس الاتجاه الكبير"""
+    hdata, err = get_price_data(interval, key, outputsize=250)
+    if hdata.empty:
+        return 0, "🟡 غير متوفر"
+    hdata = add_indicators(hdata)
+    hlast = hdata.iloc[-1]
+    hprice = float(hlast["Close"])
+    hema200 = hlast["EMA200"]
+    if pd.isna(hema200):
+        hema200 = hprice
+    hema200 = float(hema200)
+
+    if hprice > hema200:
+        return 1, "🟢 الاتجاه الأكبر صاعد (BULLISH)"
+    else:
+        return -1, "🔴 الاتجاه الأكبر هابط (BEARISH)"
+
+
+def detect_liquidity_sweep(df, lookback=30, recent_window=5):
+    """
+    يكتشف نمط 'سحب السيولة' (Liquidity Sweep) البسيط:
+    لما السعر يكسر قاع/قمة سابقة (يصطاد أوامر وقف الخسارة) ثم يرتد بسرعة عكس الكسر،
+    هذا غالبًا يدل على انعكاس محتمل — مفهوم شائع عند متداولي Smart Money Concepts.
+    """
+    if len(df) < lookback + recent_window:
+        return 0, "🟡 بيانات غير كافية لتحليل السيولة"
+
+    recent = df.tail(lookback + recent_window)
+    reference = recent.iloc[:lookback]
+    last_candles = recent.iloc[lookback:]
+
+    if reference.empty or last_candles.empty:
+        return 0, "🟡 بيانات غير كافية لتحليل السيولة"
+
+    swing_low = reference["Low"].min()
+    swing_high = reference["High"].max()
+
+    bullish_sweep = (last_candles["Low"].min() < swing_low) and (last_candles["Close"].iloc[-1] > swing_low)
+    bearish_sweep = (last_candles["High"].max() > swing_high) and (last_candles["Close"].iloc[-1] < swing_high)
+
+    if bullish_sweep and not bearish_sweep:
+        return 1, "🟢 تم رصد سحب سيولة صعودي (كسر قاع سابق ثم ارتداد) — إشارة انعكاس محتملة للأعلى"
+    elif bearish_sweep and not bullish_sweep:
+        return -1, "🔴 تم رصد سحب سيولة هبوطي (كسر قمة سابقة ثم ارتداد) — إشارة انعكاس محتملة للأسفل"
+    else:
+        return 0, "🟡 ما كو نمط سحب سيولة واضح حاليًا"
+
+
 # =========================================================
 # جلب بيانات التحليل الحي
 # =========================================================
@@ -180,7 +238,7 @@ data = add_indicators(data)
 
 
 # =========================================================
-# تحليل الأخبار (News Sentiment) - بدون API key
+# تحليل الأخبار (News Sentiment)
 # =========================================================
 
 BULLISH_WORDS = [
@@ -254,7 +312,7 @@ news_score, news_label, matched_news = analyze_news(headlines)
 
 
 # =========================================================
-# نظام التقييم الكلي للتحليل الحي (فني + أخبار)
+# النظام الذكي الكلي: فني + أخبار + فريم أعلى + سيولة
 # =========================================================
 
 last = data.iloc[-1]
@@ -272,54 +330,80 @@ recent = data.tail(lookback)
 resistance = float(recent["High"].max())
 support = float(recent["Low"].min())
 
-score, trend_label, momentum_label, rsi_label, macd_label, ema200_label = technical_score(
+base_score, trend_label, momentum_label, rsi_label, macd_label, ema200_label = technical_score(
     price, ema20, ema50, ema200, rsi, macd_value, macd_signal
 )
-score += news_score
 
-if score >= 4:
+higher_tf_interval = HIGHER_TF_MAP[tf_choice]
+higher_bias_score, higher_bias_label = get_higher_tf_bias(higher_tf_interval, api_key)
+
+liquidity_score, liquidity_msg = detect_liquidity_sweep(data)
+
+# الأوزان: الفريم الأعلى وزنه أكبر لأنه يمثل الاتجاه الحقيقي
+WEIGHT_NEWS = 1
+WEIGHT_HIGHER_TF = 2
+WEIGHT_LIQUIDITY = 1
+
+score = base_score + (news_score * WEIGHT_NEWS) + (higher_bias_score * WEIGHT_HIGHER_TF) + (liquidity_score * WEIGHT_LIQUIDITY)
+
+max_possible_score = 5 + WEIGHT_NEWS + WEIGHT_HIGHER_TF + WEIGHT_LIQUIDITY  # = 9
+buy_threshold = 5
+sell_threshold = -5
+
+if score >= buy_threshold:
     signal = "BUY"
-elif score <= -4:
+elif score <= sell_threshold:
     signal = "SELL"
 else:
     signal = "WAIT"
 
-max_possible_score = 6
-confidence = min(90, 50 + int(abs(score) / max_possible_score * 40))
+confidence = min(92, 45 + int(abs(score) / max_possible_score * 47))
+
+# تحذير عند تعارض الفريم الصغير مع الفريم الأكبر
+conflict_warning = None
+if signal == "BUY" and higher_bias_score < 0:
+    conflict_warning = "⚠️ الإشارة صاعدة على هذا الفريم، لكن الاتجاه الأكبر هابط — دخول بحذر أكثر أو انتظار توافق."
+elif signal == "SELL" and higher_bias_score > 0:
+    conflict_warning = "⚠️ الإشارة هابطة على هذا الفريم، لكن الاتجاه الأكبر صاعد — دخول بحذر أكثر أو انتظار توافق."
+
+
+# =========================================================
+# Entry / SL / TP1 / TP2 (أهداف مرحلية)
+# =========================================================
 
 entry = price
 atr_multiplier_sl = 1.5
-atr_multiplier_tp = 3.0
+atr_multiplier_tp1 = 2.0
+atr_multiplier_tp2 = 3.5
 
 if signal == "BUY":
     sl = min(entry - atr * atr_multiplier_sl, support)
-    tp = max(entry + atr * atr_multiplier_tp, resistance)
+    tp1 = entry + atr * atr_multiplier_tp1
+    tp2 = max(entry + atr * atr_multiplier_tp2, resistance)
 elif signal == "SELL":
     sl = max(entry + atr * atr_multiplier_sl, resistance)
-    tp = min(entry - atr * atr_multiplier_tp, support)
+    tp1 = entry - atr * atr_multiplier_tp1
+    tp2 = min(entry - atr * atr_multiplier_tp2, support)
 else:
     sl = entry - atr * atr_multiplier_sl
-    tp = entry + atr * atr_multiplier_tp
+    tp1 = entry + atr * atr_multiplier_tp1
+    tp2 = entry + atr * atr_multiplier_tp2
 
 risk = abs(entry - sl)
-reward = abs(tp - entry)
-rr_ratio = round(reward / risk, 2) if risk > 0 else 0
+reward1 = abs(tp1 - entry)
+reward2 = abs(tp2 - entry)
+rr1 = round(reward1 / risk, 2) if risk > 0 else 0
+rr2 = round(reward2 / risk, 2) if risk > 0 else 0
 
 
 # =========================================================
-# محرك الباك تست
+# محرك الباك تست (يعتمد على المنطق الفني الأساسي فقط)
 # =========================================================
 
 def run_backtest(df, sl_mult=1.5, tp_mult=3.0):
-    """
-    يمشي على البيانات التاريخية شمعة شمعة، ولما تتحقق شروط BUY/SELL
-    (نفس منطق التحليل الحي بدون الأخبار) يفتح صفقة وهمية،
-    ويتابعها لين توصل SL أو TP، ويسجل النتيجة.
-    """
     trades = []
     position = None
-
-    start_idx = 200  # نبدأ بعد ما تتوفر EMA200
+    start_idx = 200
 
     for i in range(start_idx, len(df)):
         row = df.iloc[i]
@@ -353,11 +437,8 @@ def run_backtest(df, sl_mult=1.5, tp_mult=3.0):
                     tp_price = min(entry_price - atr_val * tp_mult, sup)
 
                 position = {
-                    "side": side,
-                    "entry": entry_price,
-                    "sl": sl_price,
-                    "tp": tp_price,
-                    "entry_time": df.index[i],
+                    "side": side, "entry": entry_price, "sl": sl_price,
+                    "tp": tp_price, "entry_time": df.index[i],
                 }
         else:
             side = position["side"]
@@ -378,19 +459,12 @@ def run_backtest(df, sl_mult=1.5, tp_mult=3.0):
 
             if hit:
                 exit_price = position["tp"] if hit == "TP" else position["sl"]
-                if side == "BUY":
-                    pnl = exit_price - position["entry"]
-                else:
-                    pnl = position["entry"] - exit_price
+                pnl = (exit_price - position["entry"]) if side == "BUY" else (position["entry"] - exit_price)
 
                 trades.append({
-                    "side": side,
-                    "entry_time": position["entry_time"],
-                    "exit_time": df.index[i],
-                    "entry": position["entry"],
-                    "exit": exit_price,
-                    "result": "WIN" if hit == "TP" else "LOSS",
-                    "pnl": pnl,
+                    "side": side, "entry_time": position["entry_time"], "exit_time": df.index[i],
+                    "entry": position["entry"], "exit": exit_price,
+                    "result": "WIN" if hit == "TP" else "LOSS", "pnl": pnl,
                 })
                 position = None
 
@@ -401,11 +475,11 @@ def run_backtest(df, sl_mult=1.5, tp_mult=3.0):
 # التبويبات
 # =========================================================
 
-tab_live, tab_backtest = st.tabs(["📈 التحليل الحي", "🧪 اختبار الاستراتيجية (Backtest)"])
+tab_live, tab_backtest = st.tabs(["📈 التحليل الحي الذكي", "🧪 اختبار الاستراتيجية (Backtest)"])
 
 
 # ---------------------------------------------------------
-# تبويب 1: التحليل الحي
+# تبويب 1: التحليل الحي الذكي
 # ---------------------------------------------------------
 
 with tab_live:
@@ -416,16 +490,30 @@ with tab_live:
     with col1:
         st.metric("سعر الذهب", f"${price:,.2f}")
     with col2:
-        st.metric("الاتجاه العام", trend_label)
+        st.metric("الاتجاه العام (فريم حالي)", trend_label)
     with col3:
         signal_emoji = {"BUY": "🟢", "SELL": "🔴", "WAIT": "🟡"}[signal]
-        st.metric("الإشارة", f"{signal_emoji} {signal}")
+        st.metric("الإشارة الذكية", f"{signal_emoji} {signal}")
     with col4:
         st.metric("نسبة الثقة", f"{confidence}%")
 
+    if conflict_warning:
+        st.warning(conflict_warning)
+
     st.divider()
 
-    st.subheader("📊 تحليل السوق (فني)")
+    st.subheader("🧠 التحليل الذكي متعدد الأبعاد")
+    d1, d2 = st.columns(2)
+    with d1:
+        st.markdown(f"**📐 الاتجاه الأكبر ({higher_tf_interval}):**\n\n{higher_bias_label}")
+        st.caption("نتفادى الدخول عكس الاتجاه الأكبر قدر الإمكان")
+    with d2:
+        st.markdown(f"**💧 تحليل السيولة (Liquidity):**\n\n{liquidity_msg}")
+        st.caption("كشف مناطق اصطياد وقف الخسارة (Stop Hunt) المحتملة")
+
+    st.divider()
+
+    st.subheader("📊 تحليل السوق (فني - الفريم الحالي)")
     a1, a2, a3, a4, a5 = st.columns(5)
     with a1:
         st.markdown(f"**Trend**\n\n{trend_label}")
@@ -448,13 +536,13 @@ with tab_live:
             for title, label in matched_news[:10]:
                 st.write(f"{label} — {title}")
     else:
-        st.caption("ما كو عناوين إخبارية واضحة التأثير حاليًا، الاعتماد الأكبر على التحليل الفني.")
+        st.caption("ما كو عناوين إخبارية واضحة التأثير حاليًا.")
 
     st.divider()
 
-    st.subheader("🎯 تفاصيل الإشارة")
+    st.subheader("🎯 خطة الصفقة المقترحة")
     if signal == "WAIT":
-        st.warning("السوق حاليًا بدون اتجاه واضح (WAIT). لا توجد صفقة موصى بها الآن — الأفضل الانتظار.")
+        st.warning("السوق حاليًا بدون توافق كافي بين كل عناصر التحليل (WAIT). الأفضل الانتظار لحين وضوح أكبر.")
     else:
         s1, s2, s3, s4 = st.columns(4)
         with s1:
@@ -462,9 +550,16 @@ with tab_live:
         with s2:
             st.metric("وقف الخسارة (SL)", f"${sl:,.2f}")
         with s3:
-            st.metric("جني الأرباح (TP)", f"${tp:,.2f}")
+            st.metric("الهدف الأول (TP1)", f"${tp1:,.2f}")
         with s4:
-            st.metric("Risk/Reward", f"1 : {rr_ratio}")
+            st.metric("الهدف الثاني (TP2)", f"${tp2:,.2f}")
+
+        st.caption(f"Risk/Reward إلى TP1 = 1:{rr1}  |  إلى TP2 = 1:{rr2}")
+
+        st.info(
+            "💡 **اقتراح إدارة الصفقة:** عند الوصول لـ TP1، فكر بإغلاق نصف الصفقة ونقل وقف الخسارة "
+            "لنقطة الدخول (Break-Even) — هذا يحمي رأس المال ويخليك تستفيد من أي امتداد إضافي بأمان أكبر."
+        )
 
     st.caption(f"Support: ${support:,.2f}  |  Resistance: ${resistance:,.2f}  |  ATR: {atr:.2f}")
 
@@ -486,8 +581,8 @@ with tab_live:
     st.divider()
 
     st.warning(
-        "هذه الإشارة تحليلية وليست ضماناً لحركة السوق. "
-        "لا تستخدمها وحدها لاتخاذ قرار تداول، وأدر المخاطرة دائمًا (لا تخاطر بأكثر مما تتحمل خسارته)."
+        "هذه الإشارة تحليلية وليست ضماناً لحركة السوق. حتى مع دمج تحليل السيولة والفريمات المتعددة، "
+        "تبقى الأسواق عرضة لأحداث مفاجئة. لا تخاطر بأكثر مما تتحمل خسارته."
     )
 
 
@@ -499,8 +594,9 @@ with tab_backtest:
 
     st.subheader("🧪 اختبار الاستراتيجية على بيانات تاريخية")
     st.caption(
-        "هذا الاختبار يطبق نفس منطق التحليل الفني (بدون تحليل الأخبار، لأنه غير متوفر تاريخيًا) "
-        "على بيانات ماضية، ويحسب لو دخلت كل إشارة فعليًا شنو كانت النتيجة."
+        "هذا الاختبار يطبق المنطق الفني الأساسي فقط (بدون تحليل الأخبار أو السيولة أو الفريم الأعلى، "
+        "لأنها تحتاج طلبات API إضافية كثيرة غير متاحة بالخطة المجانية على مستوى كل شمعة تاريخية). "
+        "النتيجة تعطيك فكرة واقعية عن قوة الأساس الفني للاستراتيجية."
     )
 
     run_bt = st.button("▶️ شغّل الباك تست الآن", type="primary")
@@ -526,7 +622,6 @@ with tab_backtest:
                     losses = (trades_df["result"] == "LOSS").sum()
                     win_rate = round(wins / total_trades * 100, 1)
                     total_pnl = trades_df["pnl"].sum()
-                    avg_pnl = trades_df["pnl"].mean()
 
                     b1, b2, b3, b4 = st.columns(4)
                     with b1:
@@ -544,17 +639,13 @@ with tab_backtest:
 
                     equity_fig = go.Figure()
                     equity_fig.add_trace(go.Scatter(
-                        x=trades_df["exit_time"],
-                        y=trades_df["cumulative_pnl"],
-                        mode="lines+markers",
-                        name="Cumulative PnL",
+                        x=trades_df["exit_time"], y=trades_df["cumulative_pnl"],
+                        mode="lines+markers", name="Cumulative PnL",
                         line=dict(color="#2ecc71" if total_pnl >= 0 else "#e74c3c")
                     ))
                     equity_fig.update_layout(
                         title="منحنى الأداء التراكمي (Equity Curve) — بالنقاط",
-                        height=400,
-                        xaxis_title="الوقت",
-                        yaxis_title="النقاط التراكمية"
+                        height=400, xaxis_title="الوقت", yaxis_title="النقاط التراكمية"
                     )
                     st.plotly_chart(equity_fig, use_container_width=True)
 
@@ -577,18 +668,17 @@ with tab_backtest:
 
                     if win_rate >= 55:
                         st.success(
-                            f"نسبة النجاح التاريخية {win_rate}% — الاستراتيجية عندها أداء إيجابي على هذه الفترة، "
-                            "بس تذكر أن الأداء الماضي لا يضمن نتائج مستقبلية."
+                            f"نسبة النجاح التاريخية {win_rate}% — الأساس الفني للاستراتيجية إيجابي على هذه الفترة. "
+                            "إضافة السيولة والفريم الأعلى بالتحليل الحي غالبًا تحسن هذا الرقم أكثر، لكن الأداء الماضي لا يضمن المستقبل."
                         )
                     elif win_rate >= 45:
                         st.warning(
-                            f"نسبة النجاح التاريخية {win_rate}% — أداء متوسط، يفضل تحسين الاستراتيجية "
-                            "أو دمجها مع تحليل إضافي قبل الاعتماد عليها."
+                            f"نسبة النجاح التاريخية {win_rate}% — أداء متوسط. هذا بالضبط سبب أهمية طبقات التحليل "
+                            "الإضافية (السيولة + الفريم الأعلى) بالتحليل الحي، فهي تفلتر جزء من الإشارات الضعيفة."
                         )
                     else:
                         st.error(
-                            f"نسبة النجاح التاريخية {win_rate}% فقط — الاستراتيجية الحالية بهذا الفريم "
-                            "ما عندها أداء موثوق كفاية. جرب فريم زمني آخر أو راجع الإعدادات."
+                            f"نسبة النجاح التاريخية {win_rate}% فقط على هذا الفريم. جرب فريم زمني آخر."
                         )
     else:
         st.info("اضغط الزر أعلاه لتشغيل الاختبار على البيانات التاريخية.")
