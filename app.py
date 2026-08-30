@@ -233,7 +233,7 @@ def indicator_labels(price, ema20, ema50, ema200, rsi, macd_value, macd_signal):
 
 
 def strategy_score(strategy_key, price, ema20, ema50, ema200, rsi, macd_value, macd_signal,
-                    bb_upper, bb_lower, prior_resistance, prior_support):
+                    bb_upper, bb_lower, prior_resistance, prior_support, atr_value=np.nan):
     """كل استراتيجية عندها منطق تسجيل نقاط مختلف حسب فلسفتها"""
 
     if strategy_key == "ict":
@@ -267,10 +267,11 @@ def strategy_score(strategy_key, price, ema20, ema50, ema200, rsi, macd_value, m
         return score
 
     elif strategy_key == "mean_reversion":
+        # نشدد الشروط: تشبع أقوى (25/75 بدل 30/70) يقلل الإشارات الضعيفة
         score = 0
-        if rsi < 30:
+        if rsi < 25:
             score += 2
-        elif rsi > 70:
+        elif rsi > 75:
             score -= 2
         if not np.isnan(bb_lower) and price < bb_lower:
             score += 1
@@ -280,9 +281,10 @@ def strategy_score(strategy_key, price, ema20, ema50, ema200, rsi, macd_value, m
 
     elif strategy_key == "breakout":
         score = 0
-        if not np.isnan(prior_resistance) and price > prior_resistance:
+        atr_buffer = atr_value * 0.25 if not np.isnan(atr_value) else 0
+        if not np.isnan(prior_resistance) and price > prior_resistance + atr_buffer:
             score += 2
-        elif not np.isnan(prior_support) and price < prior_support:
+        elif not np.isnan(prior_support) and price < prior_support - atr_buffer:
             score -= 2
         if macd_value > macd_signal:
             score += 1
@@ -298,6 +300,23 @@ def strategy_score(strategy_key, price, ema20, ema50, ema200, rsi, macd_value, m
 
 
 STRATEGY_BASE_RANGE = {"ict": 5, "trend": 4, "mean_reversion": 3, "breakout": 4}
+
+
+def volatility_ok(atr_series, index_pos, lookback=100, min_percentile=35):
+    """
+    يتأكد أن السوق فيه حركة حقيقية (تذبذب كافي) وقت الإشارة، بدل الدخول بسوق ميت/هادئ
+    حيث تكون الإشارات عشوائية وغير موثوقة. يرجع False إذا كان ATR الحالي واطي جدًا
+    مقارنة بالفترة الأخيرة.
+    """
+    start = max(0, index_pos - lookback)
+    window = atr_series.iloc[start:index_pos]
+    current = atr_series.iloc[index_pos]
+
+    if window.empty or pd.isna(current) or len(window.dropna()) < 20:
+        return True  # ما كو بيانات كافية للفلترة، نسمح بالإشارة
+
+    percentile_rank = (window.dropna() < current).mean() * 100
+    return percentile_rank >= min_percentile
 
 
 def get_higher_tf_bias(interval, key):
@@ -443,9 +462,11 @@ trend_label, momentum_label, rsi_label, macd_label, ema200_label = indicator_lab
 
 base_score = strategy_score(
     strategy_cfg["key"], price, ema20, ema50, ema200, rsi, macd_value, macd_signal,
-    bb_upper, bb_lower, prior_resistance, prior_support
+    bb_upper, bb_lower, prior_resistance, prior_support, atr
 )
 base_range = STRATEGY_BASE_RANGE[strategy_cfg["key"]]
+
+vol_ok = volatility_ok(data["ATR"], len(data) - 1)
 
 higher_bias_score, higher_bias_label = (0, "🟡 غير مستخدم بهذه الاستراتيجية")
 if strategy_cfg["use_higher_tf"]:
@@ -470,7 +491,9 @@ max_possible_score = base_range + extra_weight
 buy_threshold = strategy_cfg["threshold"] + (extra_weight // 2)
 sell_threshold = -buy_threshold
 
-if score >= buy_threshold:
+if not vol_ok:
+    signal = "WAIT"
+elif score >= buy_threshold:
     signal = "BUY"
 elif score <= sell_threshold:
     signal = "SELL"
@@ -530,10 +553,13 @@ def run_backtest(df, strategy_key, sl_mult, tp_mult, threshold):
             continue
 
         if position is None:
+            if not volatility_ok(df["ATR"], i):
+                continue
+
             sc = strategy_score(
                 strategy_key, row["Close"], row["EMA20"], row["EMA50"], row["EMA200"],
                 row["RSI"], row["MACD"], row["MACD_SIGNAL"], row["BB_UPPER"], row["BB_LOWER"],
-                row["PriorResistance"], row["PriorSupport"]
+                row["PriorResistance"], row["PriorSupport"], row["ATR"]
             )
 
             side = None
@@ -610,6 +636,9 @@ with tab_live:
 
     if conflict_warning:
         st.warning(conflict_warning)
+
+    if not vol_ok:
+        st.warning("💤 السوق حاليًا هادئ وتذبذبه واطي (ATR منخفض مقارنة بالفترة الأخيرة) — تم تعطيل الإشارة تلقائيًا لتفادي صفقات ضعيفة الجودة.")
 
     st.divider()
 
@@ -711,11 +740,29 @@ with tab_backtest:
                     win_rate = round(wins / total_trades * 100, 1)
                     total_pnl = trades_df["pnl"].sum()
 
+                    gross_win = trades_df.loc[trades_df["pnl"] > 0, "pnl"].sum()
+                    gross_loss = abs(trades_df.loc[trades_df["pnl"] < 0, "pnl"].sum())
+                    profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else float("inf")
+                    expectancy = round(trades_df["pnl"].mean(), 2)
+
                     b1, b2, b3, b4 = st.columns(4)
                     with b1: st.metric("عدد الصفقات", total_trades)
                     with b2: st.metric("نسبة الصفقات الرابحة", f"{win_rate}%")
                     with b3: st.metric("رابحة / خاسرة", f"{wins} / {losses}")
                     with b4: st.metric("إجمالي النقاط", f"{total_pnl:,.1f}")
+
+                    b5, b6 = st.columns(2)
+                    with b5:
+                        st.metric("Profit Factor", f"{profit_factor}",
+                                  help="أكبر من 1 = الأرباح أكبر من الخسائر إجمالاً حتى لو نسبة الصفقات الرابحة أقل من 50%")
+                    with b6:
+                        st.metric("المتوسط لكل صفقة (Expectancy)", f"{expectancy:+.2f} نقطة")
+
+                    st.caption(
+                        "💡 **مهم:** نسبة الصفقات الرابحة وحدها لا تحدد نجاح الاستراتيجية. "
+                        "استراتيجية بنسبة ربح 35% مع Profit Factor أكبر من 1.5 قد تكون أفضل من "
+                        "استراتيجية بنسبة ربح 60% مع Profit Factor أقل من 1."
+                    )
 
                     st.divider()
 
@@ -743,11 +790,22 @@ with tab_backtest:
                     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
                     st.divider()
-                    if win_rate >= 55:
-                        st.success(f"نسبة النجاح التاريخية {win_rate}% — أساس فني إيجابي لهذه الاستراتيجية على هذه الفترة.")
-                    elif win_rate >= 45:
-                        st.warning(f"نسبة النجاح التاريخية {win_rate}% — أداء متوسط، جرب استراتيجية أخرى أو فريم مختلف.")
+                    if profit_factor >= 1.3 and total_pnl > 0:
+                        st.success(
+                            f"Profit Factor = {profit_factor} ونتيجة إجمالية موجبة ({total_pnl:+.1f} نقطة) — "
+                            f"رغم أن نسبة الربح {win_rate}%، هذه الاستراتيجية كانت مربحة إجمالاً على هذه الفترة "
+                            "لأن حجم الأرباح أكبر من حجم الخسائر."
+                        )
+                    elif total_pnl > 0:
+                        st.warning(
+                            f"النتيجة الإجمالية موجبة ({total_pnl:+.1f} نقطة) بنسبة ربح {win_rate}%، "
+                            f"لكن Profit Factor ({profit_factor}) ضعيف نسبيًا — الهامش الآمن قليل، "
+                            "جرب فريم زمني آخر أو راقب الأداء على فترة أطول قبل الاعتماد عليها."
+                        )
                     else:
-                        st.error(f"نسبة النجاح التاريخية {win_rate}% فقط — هذه الاستراتيجية غير مناسبة لهذا الفريم حاليًا.")
+                        st.error(
+                            f"النتيجة الإجمالية سلبية ({total_pnl:+.1f} نقطة) بنسبة ربح {win_rate}% وProfit Factor {profit_factor} — "
+                            "هذه الاستراتيجية غير مناسبة لهذا الفريم والفترة الحالية. جرب فريم زمني آخر أو استراتيجية مختلفة."
+                        )
     else:
         st.info("اضغط الزر أعلاه لتشغيل الاختبار على البيانات التاريخية.")
