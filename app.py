@@ -6,7 +6,7 @@ import feedparser
 import requests
 from streamlit_autorefresh import st_autorefresh
 from ta.momentum import RSIIndicator
-from ta.trend import MACD, EMAIndicator
+from ta.trend import MACD, EMAIndicator, ADXIndicator
 from ta.volatility import AverageTrueRange, BollingerBands
 
 
@@ -215,6 +215,10 @@ def add_indicators(df):
     df["PriorResistance"] = df["Resistance"].shift(1)
     df["PriorSupport"] = df["Support"].shift(1)
 
+    adx_ind = ADXIndicator(high=df["High"], low=df["Low"], close=df["Close"], window=14)
+    df["ADX"] = adx_ind.adx()
+    df["BBWidth"] = (df["BB_UPPER"] - df["BB_LOWER"]) / df["Close"] * 100
+
     return df
 
 
@@ -299,6 +303,39 @@ def strategy_score(strategy_key, price, ema20, ema50, ema200, rsi, macd_value, m
     return 0
 
 
+def percentile_rank(series, index_pos, lookback=100):
+    start = max(0, index_pos - lookback)
+    window = series.iloc[start:index_pos]
+    current = series.iloc[index_pos]
+    valid = window.dropna()
+    if valid.empty or pd.isna(current):
+        return 50.0
+    return (valid < current).mean() * 100
+
+
+def classify_market_regime(df, index_pos):
+    """
+    يحدد 'نظام السوق' الحالي حسب مفاهيم معروفة بتحليل الذهب:
+    - اتجاه قوي (ADX عالي) -> يناسب الاستراتيجية الاتجاهية
+    - تشبع شرائي/بيعي قوي (RSI متطرف) -> يناسب الاستراتيجية الارتدادية
+    - انضغاط بنطاق ضيق (بولينجر ضيق) -> يناسب استراتيجية الاختراق (ينتظر الانفجار)
+    - غير ذلك: سوق متقلب بدون نمط واضح -> يناسب ICT (سيولة + فريم أعلى)
+    """
+    row = df.iloc[index_pos]
+    adx_val = row["ADX"] if not pd.isna(row["ADX"]) else 0
+    rsi_val = row["RSI"] if not pd.isna(row["RSI"]) else 50
+    bbw_percentile = percentile_rank(df["BBWidth"], index_pos)
+
+    if adx_val >= 25:
+        return "📈 اتجاه قوي (Trending)", "اتجاهي (Trend Following)"
+    elif rsi_val <= 25 or rsi_val >= 75:
+        return "🎯 تشبع/تمدد قوي (Stretched)", "ارتدادي (Mean Reversion)"
+    elif bbw_percentile <= 30:
+        return "🔒 انضغاط بنطاق ضيق (Compression)", "اختراق (Breakout)"
+    else:
+        return "🌊 سوق متقلب بدون نمط واضح (Choppy)", "ICT / Smart Money Concepts"
+
+
 STRATEGY_BASE_RANGE = {"ict": 5, "trend": 4, "mean_reversion": 3, "breakout": 4}
 
 
@@ -369,6 +406,8 @@ if data.empty:
     st.stop()
 
 data = add_indicators(data)
+
+regime_label, recommended_strategy = classify_market_regime(data, len(data) - 1)
 
 
 # =========================================================
@@ -622,6 +661,14 @@ with tab_live:
 
     st.caption(f"🟢 بيانات حية — آخر تحديث: {data.index[-1].strftime('%Y-%m-%d %H:%M:%S')}")
 
+    if recommended_strategy == strategy_choice:
+        st.success(f"🔎 **نظام السوق الحالي:** {regime_label} — استراتيجيتك المختارة ({strategy_choice}) مناسبة تمامًا لهذا النظام ✅")
+    else:
+        st.info(
+            f"🔎 **نظام السوق الحالي:** {regime_label} — الاستراتيجية الأنسب حاليًا حسب تحليل النظام هي "
+            f"**{recommended_strategy}**. أنت مستخدم **{strategy_choice}**، جرب تبدلها من الشريط الجانبي لمقارنة النتيجة."
+        )
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("سعر الذهب", f"${price:,.2f}")
@@ -716,7 +763,72 @@ with tab_backtest:
         "طلبات API إضافية غير متاحة بكثرة بالخطة المجانية). يعطيك فكرة واقعية عن قوة الأساس الفني."
     )
 
-    run_bt = st.button("▶️ شغّل الباك تست الآن", type="primary")
+    bt_col1, bt_col2 = st.columns(2)
+    with bt_col1:
+        run_bt = st.button("▶️ شغّل الباك تست لهذي الاستراتيجية فقط", type="primary")
+    with bt_col2:
+        run_all_bt = st.button("🏆 قارن كل الاستراتيجيات الأربعة الآن")
+
+    if run_all_bt:
+        with st.spinner("جاري تحميل البيانات وتشغيل الباك تست على الاستراتيجيات الأربعة..."):
+            cmp_data, cmp_error = get_price_data(tf_settings, api_key, outputsize=backtest_candles)
+
+            if cmp_data.empty:
+                st.error(f"تعذر جلب بيانات كافية للمقارنة. السبب: {cmp_error}")
+            else:
+                cmp_data = add_indicators(cmp_data)
+                comparison_rows = []
+
+                for strat_name, cfg in STRATEGIES.items():
+                    t_df = run_backtest(cmp_data, cfg["key"], cfg["sl_mult"], cfg["tp2_mult"], cfg["threshold"])
+
+                    if t_df.empty:
+                        comparison_rows.append({
+                            "الاستراتيجية": strat_name, "عدد الصفقات": 0, "نسبة الربح %": 0,
+                            "Profit Factor": 0, "إجمالي النقاط": 0, "Expectancy": 0
+                        })
+                        continue
+
+                    t_total = len(t_df)
+                    t_wins = (t_df["result"] == "WIN").sum()
+                    t_win_rate = round(t_wins / t_total * 100, 1)
+                    t_gross_win = t_df.loc[t_df["pnl"] > 0, "pnl"].sum()
+                    t_gross_loss = abs(t_df.loc[t_df["pnl"] < 0, "pnl"].sum())
+                    t_pf = round(t_gross_win / t_gross_loss, 2) if t_gross_loss > 0 else round(t_gross_win, 2)
+                    t_total_pnl = round(t_df["pnl"].sum(), 1)
+                    t_expectancy = round(t_df["pnl"].mean(), 2)
+
+                    comparison_rows.append({
+                        "الاستراتيجية": strat_name, "عدد الصفقات": t_total, "نسبة الربح %": t_win_rate,
+                        "Profit Factor": t_pf, "إجمالي النقاط": t_total_pnl, "Expectancy": t_expectancy
+                    })
+
+                comparison_df = pd.DataFrame(comparison_rows).sort_values(
+                    by="إجمالي النقاط", ascending=False
+                ).reset_index(drop=True)
+
+                st.subheader("🏆 نتيجة المقارنة — نفس البيانات ونفس الفترة لكل الاستراتيجيات")
+                st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+                best_row = comparison_df.iloc[0]
+                if best_row["إجمالي النقاط"] > 0:
+                    st.success(
+                        f"🥇 **الأفضل على هذه الفترة والفريم:** {best_row['الاستراتيجية']} — "
+                        f"إجمالي {best_row['إجمالي النقاط']:+.1f} نقطة، Profit Factor = {best_row['Profit Factor']}، "
+                        f"بـ {int(best_row['عدد الصفقات'])} صفقة."
+                    )
+                else:
+                    st.warning(
+                        "⚠️ ولا وحدة من الاستراتيجيات الأربعة حققت ربح إجمالي موجب على هذه الفترة والفريم. "
+                        "جرب فريم زمني آخر أو فترة تاريخية أطول من الشريط الجانبي."
+                    )
+
+                st.caption(
+                    "💡 هذه المقارنة تتغير حسب الفريم الزمني وعدد الشموع المختار — النتيجة اليوم قد تختلف الأسبوع الجاي. "
+                    "الأفضل تكرر هذا الاختبار بشكل دوري بدل الاعتماد على نتيجة واحدة بشكل دائم."
+                )
+
+        st.divider()
 
     if run_bt:
         with st.spinner("جاري تحميل البيانات التاريخية وتشغيل الاختبار..."):
